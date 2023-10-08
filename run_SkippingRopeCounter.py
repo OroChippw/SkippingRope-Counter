@@ -9,55 +9,23 @@ import os.path as osp
 import mediapipe as mp
 import matplotlib.pyplot as plt
 
-class BufferList():
-    def __init__(self , buffer_time , default_time=0) -> None:
-        self.buffer = [default_time for _ in range(buffer_time)]
-    
-    def push(self , value):
-        self.buffer.pop(0)
-        self.buffer.append(value)
-    
-    def max(self):
-        return max(self.buffer)
-    
-    def min(self):
-        buffer = [value for value in self.buffer if value]
-        if buffer:
-            return min(buffer)
-        return 0
-        
+from utils import BufferList
 
+from mediapipe_pose_estimator import PoseEstimator
+
+    
 class SkippingRopeCounter():
-    def __init__(self , static_image_mode=False , min_detection_confidence=0.5 , 
-                 min_tracking_confidence=0.5 , smooth_landmarks=True , buffer_time=50 , 
+    def __init__(self , buffer_time=50 , 
                  device="cpu" , show=False) -> None:
-        self.mp_pose = mp.solutions.pose
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.static_image_mode = static_image_mode
-        self.smooth_landmarks = smooth_landmarks # 平滑坐标防止抖动
-        # The minimum confidence score for the pose detection to be considered successful.
-        self.min_detection_conf = min_detection_confidence # 人体检测模型置信度阈值
-        # The minimum confidence score for the pose tracking to be considered successful.
-        self.min_tracking_conf = min_tracking_confidence # 姿态置信度阈值
+        self.estimator = PoseEstimator()
+        
+        self.std_bias = 0.25 # 相对于标准值的偏差范围
+        
         self.buffer_time = buffer_time
         self.device = device
         self.show = show
         
-        # 标准点point_sd这个坐标是以视频开始第一帧画面是站在原地未起跳为前提
-        self.point_std = 0
-        self.direct = 0
-        
-        # left/right hip/shoulder point index      
-        self.hip_landmarks_idx = [23 , 24] # hip
-        self.shoulder_landmarks_idx = [11 , 12] # shoulder
-        
-        # Initialize and return Mediapipe FaceMesh Solution Graph object
-        self.pose_model = self.mp_pose.Pose(
-            static_image_mode = self.static_image_mode ,
-            min_detection_confidence = self.min_detection_conf , 
-            min_tracking_confidence = self.min_tracking_conf)
-
-        # For tracking counters and sharing states in and out of callbacks.
+        # For tracking counters and sharing states in and out of callbacks
         self.state_tracker = {
             "count" : 0
         }
@@ -66,6 +34,9 @@ class SkippingRopeCounter():
             self.buffer_time = 30
         
         self._reset_counter()
+        
+        print("[INFO] Initial Skipping Rope Counter Successfully")
+        
     
     def _get_counter(self):
         return self.state_tracker["count"]
@@ -75,7 +46,6 @@ class SkippingRopeCounter():
     
     def _preprocess(self , srcImage):
         image = cv2.cvtColor(srcImage, cv2.COLOR_BGR2RGB)
-        image = np.ascontiguousarray(srcImage)
         
         return image
     
@@ -105,7 +75,11 @@ class SkippingRopeCounter():
         
         shoulder_hip_y_distance = center_shoulder_y - center_hip_y
         
-        return center_hip_x , center_hip_y
+        point = {
+            "x" : center_hip_x , "y" : center_hip_y      
+        }
+        
+        return point , shoulder_hip_y_distance
         
         
     def _plot(self , frame , results):
@@ -118,43 +92,62 @@ class SkippingRopeCounter():
     
     def _inference_image(self , srcImage):
         self.image_height , self.image_width , _ = srcImage.shape
+        # print(f"[INFO] frame width : {self.image_width} , frame height : {self.image_height}")
         frame = srcImage.copy()
-        # To improve performance, optionally mark the image as not writeable to pass by reference.
-        srcImage.flags.writeable = False
-        print(f"[INFO] frame width : {self.image_width} , frame height : {self.image_height}")
         
         image = self._preprocess(srcImage)
         
         results = self._inference(image)
         
-        
-        
         # Indicates whether any detections are available or not.
         if results.pose_landmarks:
+            self.mid_point , y_dis = self._postprocess(self.image_height , self.image_width , results)
+            if self.mid_point["y"] > self.point_std + self.std_bias:
+                if self.direct == 0:
+                    self.state_tracker["count"] += 0.5
+                    self.direct = 1
+            if self.mid_point["y"] < self.point_std - self.std_bias:
+                if self.direct == 1:
+                    self.state_tracker["count"] += 0.5
+                    self.direct = 0
+                    
+            # cv2.putText(frame, str(int(self._get_counter())), \
+            #     (45, 460), cv2.FONT_HERSHEY_PLAIN, 7,(255, 0, 0), 8)
+            
+            cv2.putText( \
+                frame , "Count : " + str(int(self._get_counter())), \
+                (int(self.image_width * 0.6), int(self.image_height * 0.4)), \
+                cv2.FONT_HERSHEY_SIMPLEX , 0.5 , (0, 255, 255) , 1, \
+            )  
+            
             if self.show:
                 self._plot(frame , results)
+                cv2.circle(frame, (self.mid_point["x"], self.mid_point["y"]), 5, (0, 0, 255), cv2.FILLED)
+                cv2.circle(frame, (self.mid_point["x"], self.mid_point["y"]), 10, (0, 0, 255), 2)
         else:
-            print("[INFO] No keypoints of the human body were detected")
-            center_hip_x = 0
-            center_hip_y = 0
-            cy_shoulder_hip = 0
+            # print("[INFO] No keypoints of the human body were detected")
+            self.mid_point = {
+                "x" : 0 , "y" : 0      
+            }
+            y_dis = 0
             
         # Flip the frame horizontally for a selfie-view display.
         
-        return image
+        return frame
         
         
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--video-path', type=str, default='xxx.mp4', help="video path")
     parser.add_argument('--save-dir', type=str, help="save dir")
-    parser.add_argument('--draw', type=bool, default=False, help="draw keypoints")
+    parser.add_argument('--draw', action='store_true', help="draw keypoints")
     parser.add_argument('--device', type=str, default='cuda', help="device.support ['cuda' , 'cpu']")
     parser.add_argument('--detection-confidence', type=float, default=0.5, help="min detection confidence")
     parser.add_argument('--tracking-confidence', type=float, default=0.5, help="min tracking confidence")
     
     args = parser.parse_args()
     
+
     # ------ Config Start ------ # 
     DRAW = args.draw
     DEVICE = args.device
@@ -176,7 +169,6 @@ def main():
     )
     
     skippingrope_counter = SkippingRopeCounter(device=DEVICE , show=DRAW)
-    
     while cap.isOpened():
         success , frame = cap.read()
         if not success:
@@ -188,7 +180,7 @@ def main():
         fps = 1 / (time_end - time_start)
         
         cv2.imshow("RealTime SkippingRopeCounter" , result)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if cv2.waitKey(1) & 0xFF in [ord('q') , 27]:
             break
     
     skippingrope_counter._reset_counter()
