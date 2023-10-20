@@ -15,13 +15,14 @@ from mediapipe_pose_estimator import PoseEstimator
 
     
 class SkippingRopeCounter():
-    def __init__(self , buffer_time=50 , point_std=0 , std_bias=0 , 
+    def __init__(self , buffer_time=50 , init_time=50 , point_std=0 , std_bias=0 , 
                  device="cpu" , draw=False) -> None:
         self.device = device
         self.draw = draw
         
         self.estimator = PoseEstimator(
             draw=self.draw , show_arm_angle=True , show_dis_line=True)
+        self.init_time = init_time
         self.point_std = 0
         self.std_bias = std_bias # 相对于标准值的偏差范围
         self.count = 0

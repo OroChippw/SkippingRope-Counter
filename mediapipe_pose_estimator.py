@@ -9,7 +9,8 @@ class PoseEstimator():
     def __init__(self , smooth_landmarks=True ,  min_detection_confidence=0.5 , 
                  min_tracking_confidence=0.5 , angle_threshold=18 , point_std=0 , 
                  std_bias=0 , draw=False , show_arm_angle=False , show_dis_line=False) -> None:
-        self.results = None
+        self.results = None # mediapipe模型直接输出的结果
+        self.landmarks = None # 经过图片宽高进行转换的二维坐标
         
         self.mp_pose = mp.solutions.pose
         self.mp_drawing = mp.solutions.drawing_utils
@@ -23,13 +24,14 @@ class PoseEstimator():
         
         self.draw = draw
         self.show_arm_angle = show_arm_angle
-        self.show_dis_line = show_dis_line
+        self.show_jump_line = show_dis_line
+        self.shoulder_hip_y_distance = 0
     
         # left/right hip/shoulder/wrist point index      
         self.hip_landmarks_idx = [23 , 24] # hip
         self.shoulder_landmarks_idx = [11 , 12] # shoulder
         self.wrist_landmarks_idx = [15 , 16] # wrist
-        self.ankle_landmarks_idx = [27 , 28]
+        self.ankle_landmarks_idx = [27 , 28] # ankle
         
         # Initialize and return Mediapipe FaceMesh Solution Graph object
         self.pose_model = self.mp_pose.Pose(
@@ -40,7 +42,7 @@ class PoseEstimator():
         print("[INFO] Initial People Pose Estimator Successfully")
         
         
-    def _calculate_angle(self , a , b , c ,  direct=None):
+    def _calculate_angle(self , a , b , c , direct=None):
         """For calculating angle between three landmarks"""
         ba = a - b 
         bc = c - b # 分别计算b->a,b->c的向量
@@ -50,7 +52,7 @@ class PoseEstimator():
             bc_unique = np.unique(bc)
             
             if (ba_unique[0] == 0 and len(ba_unique) == 1) or \
-                (np.unique(bc)[0] == 0 and len(np.unique(bc)) == 1):
+                (np.unique(bc)[0] == 0 and len(bc_unique) == 1):
                 print("[INFO] Suspicious NAN cosine values appear")
                 
                 return 0 # 效果等价于 bc = ba
@@ -83,15 +85,27 @@ class PoseEstimator():
         else:
             return 0.0
     
-    def _is_skipping(self):
-        return 
-    
     def _is_effective_angle(self , lm):
         left_angle = self._calculate_angle(lm[15], lm[11], lm[23] , direct="left")
         right_angle = self._calculate_angle(lm[16], lm[12], lm[24] , direct="right")
         avg_angle = (left_angle + right_angle) / 2
 
         if avg_angle > self.ang_thresh:
+            return True
+        else:
+            return False
+    
+    def _is_effective_jump(self , lm):
+        if 1 == 1:
+            return True
+        else:
+            return False
+    
+    def _is_skipping(self):
+        is_effective_angle = self._is_effective_angle(self.landmarks)
+        is_effective_jump = self._is_effective_jump(self.landmarks)
+        
+        if is_effective_angle and is_effective_jump:
             return True
         else:
             return False
@@ -106,31 +120,25 @@ class PoseEstimator():
         
         return results
     
-    def _postprocess(self , frame_height , frame_width):
-        hip_landmarks = [
-            (landmark.x * frame_width , landmark.y * frame_height)
-            for index , landmark in enumerate(self.results.pose_landmarks.landmark)
-            if index in self.hip_landmarks_idx
-        ]
+    def _postprocess(self):
+        hip_x_values = [self.landmarks[x][0] for x in self.hip_landmarks_idx]
+        hip_y_values = [self.landmarks[x][1] for x in self.hip_landmarks_idx]
+        center_hip_x = int(sum(hip_x_values) / len(hip_x_values))
+        center_hip_y = int(sum(hip_y_values) / len(hip_y_values))
+        # print(f"center_hip_x : {center_hip_x} , center_hip_y : {center_hip_y}")
         
-        # 取左右盆骨点的中点作为盆骨判定点
-        center_hip_x = int(
-            np.mean([x[0] for x in hip_landmarks]))
-        center_hip_y = int(
-            np.mean([x[1] for x in hip_landmarks]))
+        shoulder_x_values = [self.landmarks[x][0] for x in self.shoulder_landmarks_idx]
+        shoulder_y_values = [self.landmarks[x][1] for x in self.shoulder_landmarks_idx]
+        center_shoulder_x = int(sum(shoulder_x_values) / len(shoulder_x_values))
+        center_shoulder_y = int(sum(shoulder_y_values) / len(shoulder_y_values))
+        # print(f"center_shoulder_x : {center_shoulder_x} , center_shoulder_y : {center_shoulder_y}")
         
-        shoulder_landmarks = [
-            (landmark.x * frame_width , landmark.y * frame_height)
-            for index , landmark in enumerate(self.results.pose_landmarks.landmark)
-            if index in self.shoulder_landmarks_idx
-        ]
-        
-        center_shoulder_y = int(np.mean([x[1] for x in shoulder_landmarks]))
-        
-        shoulder_hip_y_distance = center_shoulder_y - center_hip_y
+        shoulder_hip_y_distance = abs(center_shoulder_y - center_hip_y)
+        # print(f"shoulder_hip_y_distance : {shoulder_hip_y_distance}")
         
         point = {
-            "x" : center_hip_x , "y" : center_hip_y      
+            "mid_hip_x" : center_hip_x , "mid_hip_y" : center_hip_y , 
+            "mid_shoulder_x" : center_shoulder_x , "mid_shoulder_y" : center_shoulder_y ,       
         }
         
         return point , shoulder_hip_y_distance
@@ -178,6 +186,25 @@ class PoseEstimator():
 
         return frame
     
+    def _show_jump_line(self , frame , lm):
+        """
+            The skipping is counted by checking if the position of the feet of
+        the user cross a certain height threshold. This threshold is calculated by
+        considering the relative height of the user.
+        """
+        height , width , _ = frame.shape
+        
+        # adjust different jump heights
+        distance_1_2 = int(height * 0.020)
+        distance_1_3 = int(width * 0.097)
+        
+        left_ankle , right_ankle =  [self.landmarks[x] for x in self.ankle_landmarks_idx]
+        feet = left_ankle[1] if (left_ankle[1] > right_ankle[1]) else right_ankle[1]
+        height_factor = np.interp(self.shoulder_hip_y_distance, (0.2, 0.4), (0.8, 1.2))
+        
+        
+        return frame
+    
     def _plot(self , frame , results , lm):
         self.mp_drawing.draw_landmarks(
             frame , results.pose_landmarks , 
@@ -185,15 +212,15 @@ class PoseEstimator():
             landmark_drawing_spec = mp.solutions.drawing_styles.get_default_pose_landmarks_style()      
         )
         cv2.circle(
-            frame, (self.mid_point["x"], self.mid_point["y"]), 5, (0, 0, 255), cv2.FILLED)
+            frame, (self.mid_point["mid_hip_x"], self.mid_point["mid_hip_y"]), 5, (0, 0, 255), cv2.FILLED)
         cv2.circle(
-            frame, (self.mid_point["x"], self.mid_point["y"]), 10, (0, 0, 255), 2)
+            frame, (self.mid_point["mid_hip_x"], self.mid_point["mid_hip_y"]), 10, (0, 0, 255), 2)
         
         if self.show_arm_angle:
             frame = self._show_arm_angle(frame , lm)
         
-        if self.show_dis_line:
-            pass
+        if self.show_jump_line:
+            frame = self._show_jump_line(frame , lm)
         
         return frame
     
@@ -206,23 +233,18 @@ class PoseEstimator():
         
         self.results = self._inference(image)
         
-        landmarks = self._get_landmarks(image_height , image_width)
+        self.landmarks = self._get_landmarks(image_height , image_width)
         # print("landmarks : " , landmarks)
         # Indicates whether any detections are available or not.
-
-        if len(landmarks) != 0:
-            self.mid_point , y_dis = self._postprocess(
-                    image_height , image_width)
+        if len(self.landmarks) != 0:
+            self.mid_point , self.shoulder_hip_y_distance = self._postprocess()
             # print("[INFO] Mid Point : " , self.mid_point)
             if self.draw:
-                self._plot(frame , self.results , landmarks)
-                
+                self._plot(frame , self.results , self.landmarks)
         else:
             # print("[INFO] No keypoints of the human body were detected")
-            self.mid_point = {
-                "x" : 0 , "y" : 0      
-            }
-            y_dis = 0
+            self.mid_point = None
+            self.shoulder_hip_y_distance = 0
             
         # Flip the frame horizontally for a selfie-view display.
         
