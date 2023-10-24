@@ -22,5 +22,8 @@
 
 ```
 
+1920*1080
+1080*1920
+
 ### License
 This project is licensed under the MIT License.

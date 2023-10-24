@@ -6,25 +6,38 @@ import numpy as np
 import mediapipe as mp
 
 class PoseEstimator():
-    def __init__(self , smooth_landmarks=True ,  min_detection_confidence=0.5 , 
-                 min_tracking_confidence=0.5 , angle_threshold=18 , point_std=0 , 
-                 std_bias=0 , draw=False , show_arm_angle=False , show_dis_line=False) -> None:
+    def __init__(self , mode=None , smooth_landmarks=True ,  min_detection_confidence=0.5 , 
+                 min_tracking_confidence=0.5 , angle_threshold=18 , point_std=10 , 
+                 std_bias=5 , draw=False , show_arm_angle=False , show_dis_line=False , show_count=False) -> None:
+        # Results
         self.results = None # mediapipe模型直接输出的结果
         self.landmarks = None # 经过图片宽高进行转换的二维坐标
         
+        # Model
         self.mp_pose = mp.solutions.pose
         self.mp_drawing = mp.solutions.drawing_utils
         
+        # Settings
+        self.mode = mode
         self.smooth_landmarks = smooth_landmarks # 平滑坐标防止抖动
         self.min_detection_conf = min_detection_confidence # 人体检测模型置信度阈值
         self.min_tracking_conf = min_tracking_confidence # 姿态置信度阈值
         self.ang_thresh = angle_threshold
-        self.point_std = point_std
-        self.std_bias = std_bias
         
+        self.feet_temp = 0
+        self.std_bias = std_bias
+        self.is_skipping = False
+        self.is_effective_skipping = False
+        self.position = 0 # 位姿，初始地面为0，正常跳绳判定线之间为1，超过判定线为2
+        self.count_ = 0
+        self.count = 0
+        self.jump_anchor = 0 # 跳跃基准
+        
+        # Visualization
         self.draw = draw
         self.show_arm_angle = show_arm_angle
         self.show_jump_line = show_dis_line
+        self.show_count = show_count
         self.shoulder_hip_y_distance = 0
     
         # left/right hip/shoulder/wrist point index      
@@ -85,6 +98,9 @@ class PoseEstimator():
         else:
             return 0.0
     
+    def _get_count(self):
+        return self.count
+    
     def _is_effective_angle(self , lm):
         left_angle = self._calculate_angle(lm[15], lm[11], lm[23] , direct="left")
         right_angle = self._calculate_angle(lm[16], lm[12], lm[24] , direct="right")
@@ -95,17 +111,107 @@ class PoseEstimator():
         else:
             return False
     
-    def _is_effective_jump(self , lm):
-        if 1 == 1:
+    def _is_effective_jump(self , lm , height , width):
+        """
+            The skipping is counted by checking if the position of the feet of
+        the user cross a certain height threshold. This threshold is calculated by
+        considering the relative height of the user.
+        """
+        # adjust different jump heights
+        if self.mode == "horizontal":
+            distance_1_2 = int(height * 0.015)
+            distance_1_3 = int(height * 0.093)
+        elif self.mode == "vertical" :
+            distance_1_2 = int(height * 0.010)
+            distance_1_3 = int(height * 0.085)
+        
+        left_ankle , right_ankle =  [self.landmarks[x] for x in self.ankle_landmarks_idx]
+        
+        # 初始化跳跃基准高度为左脚踝和右脚踝中的较高值
+        feet = left_ankle[1] if (left_ankle[1] > right_ankle[1]) else right_ankle[1] 
+        anchor = feet
+        
+        # 计算出髋部和肩膀的Y坐标之差作为身体高度因子，通过插值调整，使其在特定范围内映射到另一个范围（0.2到0.4映射到0.8到1.2）
+        height_factor = np.interp(self.shoulder_hip_y_distance, (0.2, 0.4), (0.8, 1.2))
+        
+        if self._get_avg_visibility() > 0.85:
+            # if not self.is_skipping:
+            if (not self.is_skipping):
+                print(f"[INFO] Not in skipping state and initialize the anchor to {anchor}")
+                self.jump_anchor = anchor # 如果不在跳跃状态，则将base设置anchor
+                # 并调整distance距离
+                distance_1_2 = int(distance_1_2 * height_factor)
+                distance_1_3 = int(distance_1_3 * height_factor)
+                print(f"[INFO] Not in skipping state and initialize the distance_1_2 to {distance_1_2} and distance_1_3 to {distance_1_3}")
+                
+            # Skipping-Counter mechanism
+            line2 = int(self.jump_anchor - distance_1_2)
+            line3 = int(self.jump_anchor - distance_1_3)
+
+            if (not self.is_skipping):
+                print(f"[INFO] Initialize skipping threshold bot line2 : {line2} and top line3 : {line3}")
+            
+            # 用以判断加速度方向,True为向下，False为向上
+            down_direction = True if feet > self.feet_temp else False
+            
+            self.is_skipping = True
+            # 首先要明确是，在OpenCV中，图像的左上角坐标点通常是 (0, 0)
+            if feet < line2: 
+                '''
+                    若当前脚踝点高于下界且位姿为0时，判断为滞空状态
+                '''
+                if (self.position == 0) and (feet > line3):
+                    if (not down_direction):
+                        self.count += 1
+                        self.position = 1
+                        self.is_skipping = True
+                    else:
+                        # 若加速度向下，但仍高于下界，则是往后跳了
+                        print(down_direction)
+                        self.is_skipping = False 
+                
+            if feet > line2: 
+                '''
+                    若当前脚踝点低于下界，且状态为滞空，将位姿重新初始化为地面
+                '''
+                if self.position == 1:
+                    self.position = 0
+                    self.is_skipping = False
+            if feet < line3:
+                '''
+                    若当前脚踝点高于上界，且为滞空状态，则判定为双摇状态，
+                计数器加1，位姿设为2
+                '''
+                if self.position == 1: # first time over line 3
+                    self.count += 1
+                    self.position = 2
+                    self.is_skipping = True
+                    
+            if anchor > line3: # double jump
+                '''
+                    若当前脚踝点低于上界，且位姿为2，则判定为双摇下落，
+                ，将位姿设为2
+                '''
+                if self.position == 2:
+                    self.position = 1
+                    self.is_skipping = True
+                    
+            self.feet_temp = feet
+            print(f"[DEBUG] Position : {self.position} , Count : {self.count}")
             return True
-        else:
+            
+        else :
+            # 骨骼关键点可见度不高
+            print("[WARNING] Low visibility of key points of human skeleton")
+            self.jump_anchor = 0
+            self.is_skipping = False
             return False
     
-    def _is_skipping(self):
+    def _is_effective_skipping(self , height , width):
         is_effective_angle = self._is_effective_angle(self.landmarks)
-        is_effective_jump = self._is_effective_jump(self.landmarks)
+        is_effective_jump = self._is_effective_jump(self.landmarks , height=height , width=width)
         
-        if is_effective_angle and is_effective_jump:
+        if (is_effective_angle and is_effective_jump):
             return True
         else:
             return False
@@ -187,21 +293,39 @@ class PoseEstimator():
         return frame
     
     def _show_jump_line(self , frame , lm):
-        """
-            The skipping is counted by checking if the position of the feet of
-        the user cross a certain height threshold. This threshold is calculated by
-        considering the relative height of the user.
-        """
         height , width , _ = frame.shape
-        
-        # adjust different jump heights
-        distance_1_2 = int(height * 0.020)
-        distance_1_3 = int(width * 0.097)
+        if self.mode == "horizontal":
+            distance_1_2 = int(height * 0.020)
+            distance_1_3 = int(height * 0.097)
+        else :
+            distance_1_2 = int(width * 0.020)
+            distance_1_3 = int(width * 0.097)
         
         left_ankle , right_ankle =  [self.landmarks[x] for x in self.ankle_landmarks_idx]
-        feet = left_ankle[1] if (left_ankle[1] > right_ankle[1]) else right_ankle[1]
-        height_factor = np.interp(self.shoulder_hip_y_distance, (0.2, 0.4), (0.8, 1.2))
+        line2 = int(self.jump_anchor - distance_1_2)
+        line3 = int(self.jump_anchor - distance_1_3)
         
+        cv2.line(frame , (0 , line2) , (width , line2) , (0 , 0 , 255) , 3) # bottom line , red
+        cv2.line(frame , (0 , line3) , (width , line3) , (0 , 255 , 255) , 3) # top line , yellow
+        
+        feet_color = (
+            [(0, 255, 0), (255, 255, 255)]
+            if left_ankle[1] < right_ankle[1]
+            else [(255, 255, 255), (0, 255, 0)]
+        )
+        cv2.circle(frame , (left_ankle[0] , left_ankle[1]) , 8 , feet_color[0] , -1)
+        cv2.circle(frame , (right_ankle[0] , right_ankle[1]) , 8 , feet_color[1] , -1)
+        
+        return frame
+    
+    def _show_count(self , frame , count=None):
+        x = 400
+        y = 680
+        cv2.rectangle(frame, (x - 20, y - 60), (x + 100, y + 20), (0, 0, 0), -1)
+        count_text = count if count is not None else self.count
+        cv2.putText(
+            frame , str(count_text) , (x, y) , cv2.FONT_HERSHEY_SIMPLEX,
+            2 , (255, 255, 255) , 3 , 2,)
         
         return frame
     
@@ -222,7 +346,12 @@ class PoseEstimator():
         if self.show_jump_line:
             frame = self._show_jump_line(frame , lm)
         
+        if self.show_count:
+            frame = self._show_count(frame)
+        
         return frame
+    
+    
     
     def _inference_image(self , srcImage):
         image_height , image_width , _ = srcImage.shape
@@ -239,6 +368,9 @@ class PoseEstimator():
         if len(self.landmarks) != 0:
             self.mid_point , self.shoulder_hip_y_distance = self._postprocess()
             # print("[INFO] Mid Point : " , self.mid_point)
+            self.is_effective_skipping = self._is_effective_skipping(height=image_height , width=image_width)
+            if self.is_effective_skipping:
+                self.count_ += 1
             if self.draw:
                 self._plot(frame , self.results , self.landmarks)
         else:
@@ -247,6 +379,7 @@ class PoseEstimator():
             self.shoulder_hip_y_distance = 0
             
         # Flip the frame horizontally for a selfie-view display.
+        # frame = cv.flip(frame)
         
         return frame
     
